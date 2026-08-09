@@ -129,7 +129,7 @@ hr { border: none; border-top: 1px solid var(--theme-border); margin: 1rem 0; }
                 <button id="mohw-collapse">−</button>
             </div>
             <hr>
-            <div class="mohw-item hidden">TOP筆數：<input id="mohw-top" class="mohw-input hidden" type="number" value="10"></div>
+            <div class="mohw-item hidden">TOP筆數：<input id="mohw-top" class="mohw-input hidden" type="number"></div>
             <div class="mohw-item">
                 日期：<input id="mohw-date" class="mohw-date">&nbsp;~&nbsp;<input id="mohw-date2" class="mohw-date">
             </div>
@@ -339,7 +339,7 @@ hr { border: none; border-top: 1px solid var(--theme-border); margin: 1rem 0; }
 
         App.UI.getConfig = function () {
             return {
-                top: parseInt($('#mohw-top').value) || 10,
+                top: parseInt($('#mohw-top').value) || 'hidden',
                 date: $('#mohw-date').value,
                 date2: $('#mohw-date2').value,
                 types: $$('.mohw-type').filter(x => x.checked).map(x => x.value)
