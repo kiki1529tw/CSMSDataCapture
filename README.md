@@ -4,7 +4,7 @@
 ##### Step 1: 
 在chrome extensions找到
 [Tampermonkey篡改猴](https://chromewebstore.google.com/detail/%E7%AF%A1%E6%94%B9%E7%8C%B4/dhdgffkkebhmkfjojejmpbldmpobfkfo?hl=zh-TW)並安裝<br>
-於瀏覽器右上方的擴充功能 > 竄改猴 > 更多選項 > 管理擴充功能 > 開啟【允許使用者指令碼】<br><br>
+於瀏覽器右上方的擴充功能 > 竄改猴 > 更多選項 > 管理擴充功能 > 開啟【允許使用者指令碼】
 
 ##### Step 2: 
 請點擊下方連結安裝Tampermonkey腳本<br>
