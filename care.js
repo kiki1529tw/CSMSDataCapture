@@ -75,13 +75,31 @@
             return count;
         };
 
-        WorkdayCalculator.calculate = function (city, start, end) {
+        // 註：這裡改成非同步。原本假日資料只在頁面載入時預抓近三年(去年/今年/明年)，
+        // 如果查詢區間比這個範圍更長，區間涵蓋的年度可能根本沒被抓過，之前是直接靜默套用
+        // 「平日上班六日放假」預設規則，使用者不會知道。
+        // 現在改成：先檢查區間涵蓋的每個年度有沒有資料，缺的就當場補抓(一樣重試3次)，
+        // 真的抓不到才提示使用者，並非直接中止整批——因為這是資料缺口，不是任務本身執行失敗。
+        WorkdayCalculator.calculate = async function (city, start, end) {
+            const s = D.toDate(start);
+            const e = D.toDate(end);
+            const years = [];
+            for (let y = s.getFullYear(); y <= e.getFullYear(); y++) years.push(y);
+
+            const { ok, failedYears } = await global.TimeLimit.Holidays.ensureYears(years);
+            if (!ok) {
+                App.UI.status(
+                    `假日資料缺少 ${failedYears.join('、')} 年度，該區間已用「平日上班六日放假」預設規則計算，時效可能不準確`,
+                    'error'
+                );
+            }
+
             switch (city) {
                 case '新北市':
-                    return WorkdayCalculator.newTaipei(start, end);
+                    return WorkdayCalculator.newTaipei(s, e);
                 case '臺北市':
                 case '台北市':
-                    return WorkdayCalculator.taipei(start, end);
+                    return WorkdayCalculator.taipei(s, e);
                 default:
                     return '';
             }
@@ -94,16 +112,41 @@
      * API：照顧計畫相關頁面
      ********************/
     (function () {
-        App.API.fetchEdit28 = id => Http.fetchHtmlDoc('/lcms/ca/edit28/' + id);
-        App.API.fetchShowCa110 = ca110id => Http.fetchHtmlDoc('/lcms/ca/showCa110/' + ca110id);
-        App.API.fetchSubmitLog = ca110id => Http.fetchHtmlDoc('/lcms/ca/showCa110AunitSubmitL?ca110id=' + ca110id);
+        App.API.fetchEdit28 = (id, signal) => Http.fetchHtmlDoc('/lcms/ca/edit28/' + id, signal);
+        App.API.fetchShowCa110 = (ca110id, signal) => Http.fetchHtmlDoc('/lcms/ca/showCa110/' + ca110id, signal);
+        App.API.fetchSubmitLog = (ca110id, signal) => Http.fetchHtmlDoc('/lcms/ca/showCa110AunitSubmitL?ca110id=' + ca110id, signal);
+
+        // 照顧計畫列表分頁 API。
+        // 網址規則來自實際 Network 截圖比對：model[0][textpair][offset] 是位移量、
+        // model[0][textpair][max] 是每頁筆數(觀察到伺服器固定回傳5筆一頁)。
+        App.API.fetchCa110ListPage = (ca100id, offset, max, signal) => {
+            const params = new URLSearchParams();
+            params.set('template', '/ca/ca110List');
+            params.set('model[0][textpair][qca100id]', ca100id);
+            params.set('model[0][textpair][perms]', '');
+            params.set('model[0][textpair][mperms]', '');
+            params.set('model[0][textpair][noteperms]', '');
+            params.set('model[0][textpair][servnote]', '');
+            params.set('model[0][textpair][adjca116]', '');
+            params.set('model[0][textpair][qdperms]', '');
+            params.set('model[0][textpair][planByA]', 'true');
+            params.set('model[0][textpair][actPage]', 'edit28');
+            params.set('model[0][textpair][cmModel]', 'false');
+            params.set('model[0][textpair][modelOt01]', '');
+            params.set('model[0][textpair][offset]', String(offset));
+            params.set('model[0][textpair][max]', String(max));
+            params.set('_', String(Date.now()));
+            return Http.fetchHtmlDoc(`/lcms/general/render_template?${params.toString()}`, signal);
+        };
     })();
 
     /********************
      * Parser：照顧計畫列表 / 個管員 / 送退審紀錄
      ********************/
     (function () {
-        // 抓A單位個管員
+        // 觀察到伺服器每頁固定回傳5筆，寫死在這裡；如果之後伺服器改了每頁筆數，這裡要跟著調整。
+        const CA110_PAGE_SIZE = 5;
+
         App.Parser.parseManager = function (doc) {
             const tds = Dom.findRowByKeyword(doc, '主責A單位');
             const result = { aUnit: '', manager: '' };
@@ -116,16 +159,35 @@
             return result;
         };
 
-        // 照顧計畫列表
-        App.Parser.parsePlans = async function (doc) {
-            const plans = [];
-            const table = doc.querySelector('table.ca110-table');
-            if (!table) return plans;
+        // 翻頁抓出某案件底下「全部」照顧計畫列，不管有幾頁。
+        // 用「這頁筆數不滿一頁」判斷是不是最後一頁，不依賴頁面上的總筆數顯示。
+        async function fetchAllPlanRows(ca100id, controller) {
+            const rows = [];
+            let offset = 0;
+            while (true) {
+                await controller.checkpoint();
+                const doc = await App.API.fetchCa110ListPage(ca100id, offset, CA110_PAGE_SIZE, controller.signal);
+                const pageRows = [...doc.querySelectorAll('table.ca110-table tbody tr')];
+                if (pageRows.length === 0) break;
+                rows.push(...pageRows);
+                if (pageRows.length < CA110_PAGE_SIZE) break; // 這頁沒滿，代表已經是最後一頁
+                offset += CA110_PAGE_SIZE;
+            }
+            return rows;
+        }
 
-            const rows = [...table.querySelectorAll('tbody tr')];
-            for (const tr of rows) {
+        // 照顧計畫列表。三階段：
+        // 1) 翻頁抓出所有列，只用表格上「現成看得到」的資料組出候選清單，不打任何請求
+        // 2) 用類型+期間篩選(App.Filter.carematch)，先把不符合條件的計畫刷掉
+        // 3) 篩選後剩下的計畫，才去打 fetchShowCa110/fetchSubmitLog，且同一筆計畫的這兩個請求
+        //    彼此不依賴，用 Promise.all 同時發送；不同計畫之間也用 Promise.all 同時發送，
+        //    不再是「一筆打完等回應才打下一筆」的序列寫法。
+        App.Parser.parsePlans = async function (ca100id, controller) {
+            const rows = await fetchAllPlanRows(ca100id, controller);
+
+            const candidates = rows.map(tr => {
                 const td = [...tr.querySelectorAll('td')];
-                if (td.length < 10) continue;
+                if (td.length < 10) return null;
 
                 const status = td[1].innerText.replace(/\s+/g, '').trim();
                 const period = td[2].innerText.replace(/\s+/g, '').trim();
@@ -137,21 +199,54 @@
                 const match = onclickStr?.match(/showCa110\/(\d+)/);
                 const id = match ? match[1] : null;
 
-                let evaluatedate = '';
-                let city = '';
-                if (id) {
-                    const ca110doc = await App.API.fetchShowCa110(id);
-                    const resultcare = Dom.getCarePlanData(ca110doc, '照顧計畫', '評估完成日-評估人');
-                    const cityLine = Dom.getCarePlanData(ca110doc, 'A.個案基本資料', '居住地');
-                    city = cityLine?.[0]?.split('-')[0]?.trim() ?? '';
+                return { status, period, type, ca110id: id || '' };
+            }).filter(Boolean);
 
-                    const resultcareStr = typeof resultcare === 'string' ? resultcare : String(resultcare || '');
-                    evaluatedate = resultcareStr ? resultcareStr.split('-')[0].trim() : '';
-                }
+            const matched = candidates.filter(App.Filter.carematch);
 
-                plans.push({ status, period, type, ca110id: id || '', city, evaluatedate });
-            }
+            const finalized = await Promise.all(matched.map(async (p) => {
+                if (!p.ca110id) return null;
+                await controller.checkpoint();
 
+                const [ca110doc, submitLogDoc] = await Promise.all([
+                    App.API.fetchShowCa110(p.ca110id, controller.signal),
+                    App.API.fetchSubmitLog(p.ca110id, controller.signal)
+                ]);
+
+                const resultcare = Dom.getCarePlanData(ca110doc, '照顧計畫', '評估完成日-評估人');
+                const cityLine = Dom.getCarePlanData(ca110doc, 'A.個案基本資料', '居住地');
+                const rawCity = cityLine?.[0]?.split('-')[0]?.trim() ?? '';
+                const city = rawCity.includes('台北市') ? '臺北市' : rawCity; // 統一為「臺北市」
+                const resultcareStr = typeof resultcare === 'string' ? resultcare : String(resultcare || '');
+                const evaluatedate = (city === '臺北市' && p.type?.includes('重新擬定(AA01)'))
+                    ? (p.period?.split('~')[0]?.trim() ?? '')
+                    : (resultcareStr?.split('-')[0]?.trim() ?? '');
+
+                const submitLog = App.Parser.parseSubmitLog(submitLogDoc);
+                const [submitDatePart, submitTimePart] = submitLog.submitDate.split(' ');
+                const [passDatePart, passTimePart] = submitLog.passDate.split(' ');
+
+                const startTime = city === '新北市'
+                    ? D.parseROCDateTime(submitLog.submitDate)
+                    : D.parseROCDate(evaluatedate);
+                const endTime = city === '新北市'
+                    ? D.parseROCDateTime(submitLog.passDate)
+                    : D.parseROCDate(passDatePart);
+
+                const passDays = (startTime && endTime)
+                    ? await global.TimeLimit.WorkdayCalculator.calculate(city, startTime, endTime)
+                    : '';
+
+                return {
+                    status: p.status, period: p.period, type: p.type, ca110id: p.ca110id,
+                    city, evaluatedate,
+                    submitDate: submitDatePart, submitTime: submitTimePart,
+                    passDate: passDatePart, passTime: passTimePart,
+                    passDays, rejectCount: submitLog.rejectCount
+                };
+            }));
+
+            const plans = finalized.filter(Boolean);
             log('Plans:', plans);
             return plans;
         };
@@ -188,6 +283,8 @@
 
     /********************
      * Filter：計畫類型 + 日期篩選
+     * 註：這裡是判斷「候選計畫要不要進一步打API」的依據，只吃 type/period 兩個欄位，
+     * 完全不需要 city/evaluatedate 這些要額外打請求才拿得到的資料。
      ********************/
     (function () {
         App.Filter.carematch = function (plan) {
@@ -244,45 +341,27 @@
     })();
 
     /********************
-     * Service：逐案處理照顧計畫時效
+     * Service：逐案處理照顧計畫時效。
+     * parsePlans 已經把篩選、補資料、時效計算全部做完，這裡只需要把案件層級的資訊(案號/姓名/個管員)
+     * 併進每一筆計畫即可。
      ********************/
     (function () {
-        App.Service.processCareCase = async function (item) {
-            const result = [];
-            const doc = await App.API.fetchEdit28(item.id);
+        async function processCareCaseOnce(item, controller) {
+            await controller.checkpoint();
+
+            const doc = await App.API.fetchEdit28(item.id, controller.signal);
             const manager = App.Parser.parseManager(doc);
-            const plans = await App.Parser.parsePlans(doc);
+            const plans = await App.Parser.parsePlans(item.id, controller);
 
-            for (const p of plans.filter(App.Filter.carematch)) {
-                if (!p.ca110id) continue;
+            return plans.map(p => ({
+                caseno: item.caseno, name: item.name,
+                aUnit: manager.aUnit, manager: manager.manager,
+                ...p
+            }));
+        }
 
-                const html = await App.API.fetchSubmitLog(p.ca110id);
-                const submitLog = App.Parser.parseSubmitLog(html);
-
-                const [submitDatePart, submitTimePart] = submitLog.submitDate.split(' ');
-                const [passDatePart, passTimePart] = submitLog.passDate.split(' ');
-
-                const startTime = p.city === '新北市'
-                    ? D.parseROCDateTime(submitLog.submitDate)
-                    : D.parseROCDate(p.evaluatedate);
-                const endTime = p.city === '新北市'
-                    ? D.parseROCDateTime(submitLog.passDate)
-                    : D.parseROCDate(passDatePart);
-
-                const passDays = (startTime && endTime)
-                    ? global.TimeLimit.WorkdayCalculator.calculate(p.city, startTime, endTime)
-                    : '';
-
-                result.push({
-                    caseno: item.caseno, name: item.name, status: p.status, period: p.period,
-                    type: p.type, aUnit: manager.aUnit, manager: manager.manager,
-                    ca110id: p.ca110id, city: p.city, evaluatedate: p.evaluatedate,
-                    submitDate: submitDatePart, submitTime: submitTimePart,
-                    passDate: passDatePart, passTime: passTimePart,
-                    passDays, rejectCount: submitLog.rejectCount
-                });
-            }
-            return result;
+        App.Service.processCareCase = function (item, controller) {
+            return MOHW_CORE.Common.retryOnce(() => processCareCaseOnce(item, controller));
         };
     })();
 })(window);
