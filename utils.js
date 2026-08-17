@@ -5,7 +5,7 @@
     global.TimeLimit = global.TimeLimit || {};
 
     /********************
-     * Common：log / sleep / 全域設定
+     * Common：log / sleep / 全域設定 / retryOnce（通用「失敗重試一次」包裝）
      ********************/
     (function () {
         const Config = { debug: true, delay: 100 };
@@ -18,11 +18,32 @@
             return new Promise(r => setTimeout(r, ms));
         }
 
-        global.MOHW_CORE.Common = { Config, log, sleep };
+        // 通用的「失敗重試一次」包裝。
+        // 使用者主動停止(AbortError / StopError)不算「失敗」，不重試，直接往上丟讓呼叫端知道是被中止的。
+        // 這支函式本身不知道自己在重試「照顧計畫」還是「電訪」，純粹是執行策略，屬於共用工具。
+        async function retryOnce(fn) {
+            try {
+                return await fn();
+            } catch (e) {
+                if (isAbortLike(e)) throw e;
+                log('第一次執行失敗，自動重試一次:', e);
+                return await fn();
+            }
+        }
+
+        function isAbortLike(e) {
+            if (!e) return false;
+            if (e.name === 'AbortError') return true;
+            // ExecutionControl 定義在本檔案稍後的區塊，這裡用延遲讀取避免模組順序問題
+            const StopError = global.MOHW_CORE.ExecutionControl && global.MOHW_CORE.ExecutionControl.StopError;
+            return StopError && e instanceof StopError;
+        }
+
+        global.MOHW_CORE.Common = { Config, log, sleep, retryOnce };
     })();
 
     /********************
-     * DateUtils：ROC日期解析 + 通用日期運算 + 日期比較
+     * DateUtils：ROC日期解析 + 通用日期運算 + 日期比較 + 使用者輸入防呆
      ********************/
     (function () {
         const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -77,7 +98,7 @@
             return new Date(Number(m[1]) + 1911, Number(m[2]) - 1, Number(m[3]));
         }
 
-        // "114/06/02 13:05:00" -> Date
+        // "114/06/02 13:05:00" -> DateTime
         function parseROCDateTime(str) {
             if (!str) return null;
             const m = String(str).match(/(\d+)\/(\d+)\/(\d+)\s+(\d+):(\d+):(\d+)/);
@@ -124,11 +145,48 @@
             return c !== null && c <= 0;
         }
 
+        // 全形數字/全形斜線轉半形，供使用者輸入防呆使用
+        function toHalfWidth(str) {
+            return String(str)
+                .replace(/[\uFF10-\uFF19]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+                .replace(/\uFF0F/g, '/');
+        }
+
+        // 使用者輸入防呆：接受民國(3碼年)或西元(4碼年)，格式必須是 年/月/日(以 / 分隔)。
+        // 全形數字會自動轉半形；文字、其他分隔符號、不存在的日期(例如2/30)一律視為無效，回傳 null。
+        // 驗證通過一律正規化回內部統一使用的民國格式字串，之後的比較函式完全不用改。
+        function normalizeDateInput(str) {
+            if (!str) return null;
+            const half = toHalfWidth(str).trim();
+            const m = half.match(/^(\d{3,4})\/(\d{1,2})\/(\d{1,2})$/);
+            if (!m) return null;
+
+            const rawYear = Number(m[1]);
+            const month = Number(m[2]);
+            const day = Number(m[3]);
+            if (month < 1 || month > 12) return null;
+
+            // 4碼年一律視為西元，換算成民國；3碼年視為民國原值
+            const rocYear = rawYear >= 1000 ? rawYear - 1911 : rawYear;
+            if (rocYear < 1) return null;
+
+            // 用 Date 物件的自動進位特性反查：如果輸入的日期本身不存在(例如2/30、13月)，
+            // 轉出來的年月日會跟輸入不一致，藉此擋掉不合法的日期
+            const gYear = rocYear + 1911;
+            const check = new Date(gYear, month - 1, day);
+            if (check.getFullYear() !== gYear || check.getMonth() !== month - 1 || check.getDate() !== day) {
+                return null;
+            }
+
+            return `${rocYear}/${String(month).padStart(2, '0')}/${String(day).padStart(2, '0')}`;
+        }
+
         global.MOHW_CORE.DateUtils = {
             MS_PER_DAY, toDate, atMidnight, addDays, isWeekend, sameCalendarDay,
             isAfterNoon, nextWorkday,
             parseROCDate, parseROCDateTime, formatROC, todayFirstDay, todayLastDay,
-            compareROCDate, isDateAfter, isDateBefore
+            compareROCDate, isDateAfter, isDateBefore,
+            normalizeDateInput
         };
     })();
 
@@ -192,20 +250,20 @@
     })();
 
     /********************
-     * HttpClient：統一的 fetch + credentials 處理
+     * HttpClient：統一的 fetch + credentials 處理，支援 AbortSignal 讓「停止」可以真正中止飛行中的請求
      ********************/
     (function () {
-        async function fetchHtmlDoc(url) {
+        async function fetchHtmlDoc(url, signal) {
             global.MOHW_CORE.Common.log('Fetch HTML:', url);
-            const res = await fetch(url, { credentials: 'include' });
+            const res = await fetch(url, { credentials: 'include', signal });
             if (!res.ok) throw new Error(`fetchHtmlDoc ${url} -> ${res.status}`);
             const html = await res.text();
             return new DOMParser().parseFromString(html, 'text/html');
         }
 
-        async function fetchJson(url) {
+        async function fetchJson(url, signal) {
             global.MOHW_CORE.Common.log('Fetch JSON:', url);
-            const res = await fetch(url, { credentials: 'include' });
+            const res = await fetch(url, { credentials: 'include', signal });
             if (!res.ok) throw new Error(`fetchJson ${url} -> ${res.status}`);
             return res.json();
         }
@@ -217,7 +275,7 @@
      * XhrCapture：XHR hook + 單次認領 capture 機制
      ********************/
     (function () {
-        let pendingCapture = null; // 單次認領物件，取代全域布林開關，避免競態問題
+        let pendingCapture = null;
 
         function initHook(root) {
             if (root.LCMS_XHR_HOOKED) return;
@@ -229,7 +287,7 @@
                 this._lcmsUrl = url;
                 if (pendingCapture && url.includes(pendingCapture.urlMatch)) {
                     this._lcmsCapture = pendingCapture;
-                    pendingCapture = null; // 用掉即清空，只認領最先符合的請求
+                    pendingCapture = null;
                 }
                 return open.apply(this, arguments);
             };
@@ -270,8 +328,7 @@
     })();
 
     /********************
-     * Csv：陣列轉CSV blob並觸發下載。它不知道自己在存什麼業務資料，
-     * care.js 的 csvcare 跟 call.js 的 csvcall 都呼叫這支共用函式。
+     * Csv：陣列轉CSV blob並觸發下載
      ********************/
     (function () {
         function download(title, rows) {
@@ -291,9 +348,121 @@
     })();
 
     /********************
-     * Holidays（外部工具：純日期查詢，資料來源與LCMS系統無關，不含任何業務規則）
-     * 判斷順序：手動維護清單 > 政府開放資料(快取) > 找不到資料時預設「平日=上班、六日=放假」並印出警告
-     * 資料來源：ruyut/TaiwanCalendar（中華民國政府行政機關辦公日曆表 的逐年 JSON 鏡像）
+     * ExecutionControl：暫停 / 繼續 / 停止。
+     * 停止是「真中止」：內含一個真正的 AbortController，外部的 HTTP 請求把 controller.signal
+     * 傳進去，按下停止時連飛行中的請求都會被砍斷，不用等它自然結束。
+     ********************/
+    (function () {
+        class StopError extends Error {
+            constructor(msg) {
+                super(msg || '已停止');
+                this.name = 'StopError';
+            }
+        }
+
+        function createController() {
+            let paused = false;
+            let stopped = false;
+            let resumeWaiters = [];
+            const abortController = new AbortController();
+
+            function pause() {
+                if (stopped) return;
+                paused = true;
+            }
+
+            function resume() {
+                if (stopped) return;
+                paused = false;
+                resumeWaiters.forEach(r => r());
+                resumeWaiters = [];
+            }
+
+            function stop() {
+                if (stopped) return;
+                stopped = true;
+                paused = false;
+                resumeWaiters.forEach(r => r());
+                resumeWaiters = [];
+                abortController.abort();
+            }
+
+            // 業務流程在每個「合理的中斷點」呼叫這支函式：
+            // 若已停止直接丟出 StopError；若暫停中則卡住直到 resume() 或 stop() 被呼叫。
+            async function checkpoint() {
+                if (stopped) throw new StopError();
+                while (paused) {
+                    await new Promise(resolve => resumeWaiters.push(resolve));
+                    if (stopped) throw new StopError();
+                }
+            }
+
+            return {
+                get signal() { return abortController.signal; },
+                pause, resume, stop, checkpoint,
+                isPaused: () => paused,
+                isStopped: () => stopped
+            };
+        }
+
+        global.MOHW_CORE.ExecutionControl = { createController, StopError };
+    })();
+
+    /********************
+     * BatchRunner：併發數限制的批次任務執行器。
+     * 不知道自己在跑「照顧計畫」還是「電訪」，只認得「任務清單 + 怎麼跑一個任務 + 同時跑幾個」。
+     * 任一任務丟出非中止類的錯誤，視為「真的失敗」，記錄下來並呼叫 controller.stop() 中止全部。
+     ********************/
+    (function () {
+        async function run(tasks, worker, concurrency, controller) {
+            let index = 0;
+            let firstError = null;
+            let firstErrorTask = null;
+            const results = new Array(tasks.length);
+            const StopError = global.MOHW_CORE.ExecutionControl.StopError;
+
+            async function runSlot() {
+                while (true) {
+                    if (controller.isStopped()) return;
+                    try {
+                        await controller.checkpoint();
+                    } catch (e) {
+                        return; // 在暫停中被要求停止
+                    }
+
+                    const i = index++;
+                    if (i >= tasks.length) return;
+                    const task = tasks[i];
+
+                    try {
+                        const value = await worker(task, i);
+                        results[i] = { task, ok: true, value };
+                    } catch (e) {
+                        if (e && (e.name === 'AbortError' || e instanceof StopError)) {
+                            return; // 使用者主動停止造成的中止，不算失敗
+                        }
+                        results[i] = { task, ok: false, error: e };
+                        if (!firstError) {
+                            firstError = e;
+                            firstErrorTask = task;
+                            controller.stop(); // 一個真正的失敗，中止其餘所有任務
+                        }
+                        return;
+                    }
+                }
+            }
+
+            const slots = Array.from({ length: Math.min(concurrency, tasks.length) }, () => runSlot());
+            await Promise.all(slots);
+            return { results, firstError, firstErrorTask };
+        }
+
+        global.MOHW_CORE.BatchRunner = { run };
+    })();
+
+    /********************
+     * Holidays（外部工具：純日期查詢）
+     * 每個年度最多重試 3 次，全部年度都成功才算「就緒」；重試用完仍失敗的年度改用預設規則(平日上班六日放假)。
      ********************/
     (function () {
         const manualHolidays = {
@@ -303,8 +472,9 @@
 
         const DATA_URL_TEMPLATE = 'https://raw.githubusercontent.com/ruyut/TaiwanCalendar/master/data/{year}.json';
         const govCache = {};
-        const fetchFailedYears = new Set();
         const warnedDates = new Set();
+        const inFlightFetches = {}; // year -> Promise<boolean>，避免同一年度被併發的多個案件同時重複抓
+        let ready = false;
 
         function pad2(n) { return String(n).padStart(2, '0'); }
 
@@ -312,30 +482,67 @@
             return `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}`;
         }
 
-        async function fetchYear(year) {
-            if (govCache[year] || fetchFailedYears.has(year)) return;
+        async function fetchYearOnce(year) {
+            if (govCache[year]) return;
             const url = DATA_URL_TEMPLATE.replace('{year}', year);
-            try {
-                const res = await fetch(url);
-                if (!res.ok) throw new Error('HTTP ' + res.status);
-                const list = await res.json();
-                const map = {};
-                list.forEach((item) => { map[item.date] = !!item.isHoliday; });
-                govCache[year] = map;
-                console.info(`[假日資料] 已成功抓取 ${year} 年政府行政機關辦公日曆表`);
-            } catch (err) {
-                fetchFailedYears.add(year);
-                console.warn(
-                    `[假日資料] 無法自動抓取 ${year} 年政府假日資料 (${err.message})，` +
-                    `該年度日期若非手動清單登記者，將以「平日上班、六日放假」為預設值計算，` +
-                    `請確認是否需要在 manualHolidays 手動補登該年度的國定假日/補班日。`
-                );
-            }
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const list = await res.json();
+            const map = {};
+            list.forEach((item) => { map[item.date] = !!item.isHoliday; });
+            govCache[year] = map;
+            console.info(`[假日資料] 已成功抓取 ${year} 年政府行政機關辦公日曆表`);
         }
 
+        async function fetchYearWithRetry(year, maxAttempts = 3) {
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    await fetchYearOnce(year);
+                    return true;
+                } catch (err) {
+                    console.warn(`[假日資料] ${year} 年第 ${attempt}/${maxAttempts} 次抓取失敗 (${err.message})`);
+                }
+            }
+            console.warn(`[假日資料] ${year} 年重試 ${maxAttempts} 次後仍失敗，該年度將改用「平日上班、六日放假」預設規則計算`);
+            return false;
+        }
+
+        // 帶「同年度併發去重」的版本：如果好幾個案件同時發現缺同一年度的資料，
+        // 只會真的送出一次請求，其他呼叫端等同一個 Promise，不會對同一年度重複打好幾次。
+        function fetchYearWithRetryDeduped(year) {
+            if (govCache[year]) return Promise.resolve(true);
+            if (inFlightFetches[year]) return inFlightFetches[year];
+            const p = fetchYearWithRetry(year).finally(() => { delete inFlightFetches[year]; });
+            inFlightFetches[year] = p;
+            return p;
+        }
+
+        // 回傳 boolean：本次所有年度是否都成功抓到政府資料。
+        // 只要有一年失敗，就代表當年度的假日/補班判斷退回預設規則，需要提醒使用者。
         async function preload(years) {
             const list = Array.isArray(years) ? years : [years];
-            await Promise.all([...new Set(list)].map(fetchYear));
+            const outcomes = await Promise.all([...new Set(list)].map(y => fetchYearWithRetryDeduped(y)));
+            ready = outcomes.every(Boolean);
+            return ready;
+        }
+
+        function isReady() {
+            return ready;
+        }
+
+        // 執行時才發現需要某個(通常是查詢區間比預載範圍更長導致的)年度資料：
+        // 只抓「目前還沒有資料」的年度，已經有的年度不重複打。
+        // 回傳 { ok, failedYears }，failedYears 是重試3次後仍失敗的年度清單。
+        async function ensureYears(years) {
+            const list = [...new Set(Array.isArray(years) ? years : [years])];
+            const missing = list.filter(y => !govCache[y]);
+            if (missing.length === 0) return { ok: true, failedYears: [] };
+
+            const outcomes = await Promise.all(
+                missing.map(async y => ({ year: y, ok: await fetchYearWithRetryDeduped(y) }))
+            );
+            const failedYears = outcomes.filter(o => !o.ok).map(o => o.year);
+            return { ok: failedYears.length === 0, failedYears };
         }
 
         function lookup(date) {
@@ -349,10 +556,7 @@
             }
             if (!warnedDates.has(key)) {
                 warnedDates.add(key);
-                console.warn(
-                    `[假日資料] 日期 ${key} 查無手動清單或政府假日資料，` +
-                    `已依「平日上班、六日放假」預設值計算，建議手動確認並補登 manualHolidays。`
-                );
+                console.warn(`[假日資料] 日期 ${key} 查無手動清單或政府假日資料，已依「平日上班、六日放假」預設值計算。`);
             }
             return undefined;
         }
@@ -364,7 +568,7 @@
             return day === 0 || day === 6;
         }
 
-        global.TimeLimit.Holidays = { manualHolidays, preload, isHoliday };
+        global.TimeLimit.Holidays = { manualHolidays, preload, isReady, isHoliday, ensureYears };
     })();
 
 })(window);

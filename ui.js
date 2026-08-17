@@ -27,6 +27,9 @@
         };
 
         let currentTheme = null;
+        let elapsedTimerId = null;
+        let elapsedStart = 0;
+        let elapsedPausedAt = 0; // 非0代表目前暫停中，記錄暫停當下的時間點
 
         App.UI.setTheme = function (name) {
             const theme = themes[name];
@@ -91,6 +94,7 @@
 .mohw-item label { margin-right: 5px; cursor: pointer; }
 .mohw-input { width: 9rem; padding: 4px 8px; border-radius: 5px; text-align: center; border: 1px solid var(--theme-border); }
 .mohw-date { width: 9rem; padding: 4px 8px; border-radius: 5px; text-align: center; border: 1px solid var(--theme-border); }
+.mohw-date.mohw-input-error { border-color: #b06b6b; background: #fdf2f2; }
 .mohw-type, .mohw-exporttype {
     margin-right: 5px !important; accent-color: var(--theme-main);
     width: 16px; height: 16px; vertical-align: text-bottom; cursor: pointer;
@@ -103,6 +107,14 @@
 }
 .mohw-exportbtn button:hover { background: var(--theme-hover); transform: translateY(-1px); }
 .mohw-exportbtn button:disabled { opacity: .6; cursor: not-allowed; transform: none; }
+.mohw-controlbtn { display: flex; gap: 8px; margin-bottom: 12px; }
+.mohw-controlbtn button {
+    flex: 1; padding: 10px; background: var(--theme-main); color: white;
+    border: none; border-radius: 8px; cursor: pointer; font-size: 13px;
+    transition: background .3s;
+}
+.mohw-controlbtn button:hover:not(:disabled) { background: var(--theme-hover); }
+.mohw-controlbtn button:disabled { opacity: .5; cursor: not-allowed; }
 #mohw-status { margin-top: 10px; font-size: 16px; font-weight: bold; }
 .status-info { color: var(--theme-main); }
 .status-success { color: #6c9a7e; }
@@ -144,7 +156,13 @@ hr { border: none; border-top: 1px solid var(--theme-border); margin: 1rem 0; }
                 <label><input class="mohw-exporttype" type="checkbox" value="A" checked>照顧計畫</label>
                 <label><input class="mohw-exporttype" type="checkbox" value="B" checked>電訪記錄</label>
             </div>
-            <div class="mohw-exportbtn"><button id="mohw-start">匯出紀錄</button></div>
+            <div class="mohw-item">併發數：<input id="mohw-concurrency" class="mohw-input" type="number" value="10" min="1" max="30"></div>
+            <div class="mohw-item">已耗時：<span id="mohw-elapsed">00:00</span></div>
+            <div class="mohw-exportbtn"><button id="mohw-start" disabled>匯出紀錄</button></div>
+            <div class="mohw-controlbtn">
+                <button id="mohw-pause" disabled>暫停</button>
+                <button id="mohw-stop" disabled>停止</button>
+            </div>
             <div id="mohw-status"></div>
         </div>
     `;
@@ -152,6 +170,7 @@ hr { border: none; border-top: 1px solid var(--theme-border); margin: 1rem 0; }
 
             $('#mohw-date').value = MOHW_CORE.DateUtils.todayFirstDay();
             $('#mohw-date2').value = MOHW_CORE.DateUtils.todayLastDay();
+            App.UI.bindDateValidation();
 
             App.UI.restorePosition();
             App.UI.pickAnchor();
@@ -342,8 +361,115 @@ hr { border: none; border-top: 1px solid var(--theme-border); margin: 1rem 0; }
                 top: parseInt($('#mohw-top').value) || 'hidden',
                 date: $('#mohw-date').value,
                 date2: $('#mohw-date2').value,
+                concurrency: parseInt($('#mohw-concurrency').value) || 10,
                 types: $$('.mohw-type').filter(x => x.checked).map(x => x.value)
             };
+        };
+
+        /********************
+         * 執行狀態控制：idle / running / paused 三種狀態切換按鈕的可用性與文字
+         ********************/
+        App.UI.setRunningState = function (state) {
+            const startBtn = $('#mohw-start');
+            const pauseBtn = $('#mohw-pause');
+            const stopBtn = $('#mohw-stop');
+            if (!startBtn || !pauseBtn || !stopBtn) return;
+
+            if (state === 'idle') {
+                startBtn.disabled = !TimeLimit.Holidays.isReady();
+                startBtn.innerText = '匯出紀錄';
+                pauseBtn.disabled = true;
+                pauseBtn.innerText = '暫停';
+                stopBtn.disabled = true;
+            } else if (state === 'running') {
+                startBtn.disabled = true;
+                startBtn.innerText = '抓取中...';
+                pauseBtn.disabled = false;
+                pauseBtn.innerText = '暫停';
+                stopBtn.disabled = false;
+            } else if (state === 'paused') {
+                pauseBtn.innerText = '繼續';
+            }
+        };
+
+        // 相容舊呼叫：部分文件/流程仍會呼叫 setLoading，這裡轉呼叫新的狀態機
+        App.UI.setLoading = function (loading) {
+            App.UI.setRunningState(loading ? 'running' : 'idle');
+        };
+
+        /********************
+         * 國定假日就緒狀態：影響「開始抓取」按鈕能不能按
+         ********************/
+        App.UI.setHolidaysReady = function (ready, message) {
+            const startBtn = $('#mohw-start');
+            if (!startBtn) return;
+            startBtn.disabled = !ready;
+            if (!ready && message) App.UI.status(message, 'error');
+        };
+
+        /********************
+         * 已耗時計時器
+         ********************/
+        App.UI.startElapsedTimer = function () {
+            elapsedStart = Date.now();
+            elapsedPausedAt = 0;
+            App.UI.updateElapsed();
+            elapsedTimerId = setInterval(App.UI.updateElapsed, 1000);
+        };
+
+        // 暫停時：停止累加，記下暫停的當下時間點
+        App.UI.pauseElapsedTimer = function () {
+            if (elapsedTimerId) {
+                clearInterval(elapsedTimerId);
+                elapsedTimerId = null;
+            }
+            elapsedPausedAt = Date.now();
+        };
+
+        // 繼續時：把「暫停期間經過的時間」直接平移到 elapsedStart 上，
+        // 這樣暫停的這段時間就不會被算進已耗時，畫面上的數字會停在暫停當下，不會跳動。
+        App.UI.resumeElapsedTimer = function () {
+            if (elapsedPausedAt) {
+                elapsedStart += (Date.now() - elapsedPausedAt);
+                elapsedPausedAt = 0;
+            }
+            App.UI.updateElapsed();
+            elapsedTimerId = setInterval(App.UI.updateElapsed, 1000);
+        };
+
+        App.UI.stopElapsedTimer = function () {
+            if (elapsedTimerId) clearInterval(elapsedTimerId);
+            elapsedTimerId = null;
+            elapsedPausedAt = 0;
+        };
+
+        App.UI.updateElapsed = function () {
+            const el = $('#mohw-elapsed');
+            if (!el) return;
+            const sec = Math.floor((Date.now() - elapsedStart) / 1000);
+            const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+            const ss = String(sec % 60).padStart(2, '0');
+            el.innerText = `${mm}:${ss}`;
+        };
+
+        /********************
+         * 日期輸入防呆：失焦時驗證，民國/西元皆可、全形數字自動轉換
+         ********************/
+        App.UI.bindDateValidation = function () {
+            ['#mohw-date', '#mohw-date2'].forEach(sel => {
+                const input = $(sel);
+                if (!input) return;
+                input.addEventListener('blur', () => {
+                    const normalized = MOHW_CORE.DateUtils.normalizeDateInput(input.value);
+                    if (normalized === null) {
+                        input.classList.add('mohw-input-error');
+                        App.UI.status('日期輸入錯誤，請重新輸入(範例：114/06/02)', 'error');
+                    } else {
+                        input.value = normalized;
+                        input.classList.remove('mohw-input-error');
+                    }
+                });
+            });
         };
     })();
 })(window);
