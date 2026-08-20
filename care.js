@@ -274,7 +274,7 @@
                     passTime = date;
                     result.passDate = time;
                 }
-                if (action.includes('退件')) result.rejectCount++;
+                if (action.includes('照顧計畫審核退件')) result.rejectCount++;
             });
 
             return result;
