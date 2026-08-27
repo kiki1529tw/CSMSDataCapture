@@ -114,9 +114,8 @@
             MOHW_CORE.XhrCapture.observeFrames();
 
             // 維持原本的頁面判斷：只有進到對的頁籤(tree130出現)才建立面板
-            const tree130 = await waitElement('#TREE-351013527');
-            const tree100 = await waitElement('#TREE-278270613');
-            if (!tree130 && !tree100) return;
+            const tree130 = await waitElement('#TREE-351013527,#TREE-278270613');
+            if (!tree130) return;
 
             App.UI.createPanel();
 
