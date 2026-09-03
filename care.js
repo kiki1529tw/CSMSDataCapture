@@ -96,10 +96,10 @@
 
             switch (city) {
                 case '新北市':
+                case '桃園市':
                     return WorkdayCalculator.newTaipei(s, e);
                 case '臺北市':
-                case '台北市':
-                case '桃園市':
+                case '台北市':                
                     return WorkdayCalculator.taipei(s, e);
                 default:
                     return '';
@@ -219,7 +219,7 @@
                 const rawCity = cityLine?.[0]?.split('-')[0]?.trim() ?? '';
                 const city = rawCity.includes('台北市') ? '臺北市' : rawCity; // 統一為「臺北市」
                 const resultcareStr = typeof resultcare === 'string' ? resultcare : String(resultcare || '');
-                const evaluatedate = ((city === '臺北市'||city === '桃園市')&& p.type?.includes('重新擬定(AA01)'))
+                const evaluatedate = (city === '臺北市')&& p.type?.includes('重新擬定(AA01)')
                     ? (p.period?.split('~')[0]?.trim() ?? '')
                     : (resultcareStr?.split('-')[0]?.trim() ?? '');
 
@@ -227,10 +227,10 @@
                 const [submitDatePart, submitTimePart] = submitLog.submitDate.split(' ');
                 const [passDatePart, passTimePart] = submitLog.passDate.split(' ');
 
-                const startTime = city === '新北市'
+                const startTime = (city === '新北市'||city === '桃園市')
                     ? D.parseROCDateTime(submitLog.submitDate)
                     : D.parseROCDate(evaluatedate);
-                const endTime = city === '新北市'
+                const endTime = (city === '新北市'||city === '桃園市')
                     ? D.parseROCDateTime(submitLog.passDate)
                     : D.parseROCDate(passDatePart);
 
@@ -319,9 +319,11 @@
                 { title: '評估完成日', field: x => x.evaluatedate },
                 { title: '審核通過日期', field: x => x.passDate }
             ],
-             '桃園市': [
-                { title: '評估完成日', field: x => x.evaluatedate },
-                { title: '審核通過日期', field: x => x.passDate }
+            '桃園市': [
+                { title: '待A單位擬照顧計畫日期', field: x => x.submitDate },
+                { title: '待A單位擬照顧計畫時間', field: x => x.submitTime },
+                { title: '審核通過日期', field: x => x.passDate },
+                { title: '審核通過時間', field: x => x.passTime }
             ]
         };
 
